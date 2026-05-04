@@ -1,0 +1,25 @@
+version = 0.1
+
+[default.build.parameters]
+template_file = "c:\\Users\\MAX\\Projects\\CMSC471\\template.yaml"
+cached = true
+parallel = true
+use_container = false
+
+[default.global.parameters]
+region = "us-east-1"
+stack_name = "cmsc471-hello-stack"
+
+[default.deploy.parameters]
+stack_name = "cmsc471-hello-stack"
+resolve_s3 = true
+s3_prefix = "cmsc471-hello-stack"
+confirm_changeset = true
+capabilities = "CAPABILITY_IAM"
+image_repositories = [ ]
+
+[default.sync.parameters]
+template_file = "c:\\Users\\MAX\\Projects\\CMSC471\\template.yaml"
+stack_name = "cmsc471-hello-stack"
+dependency_layer = false
+watch = true
