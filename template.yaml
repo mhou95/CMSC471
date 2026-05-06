@@ -1,52 +1,612 @@
+AWSTemplateFormatVersion: '2010-09-09'
 Transform: AWS::Serverless-2016-10-31
+Description: CMSC 471 Final - 4-tier image-to-text application with Textract
+
+# All compute uses LabRole (arn:aws:iam::<account>:role/LabRole).
+# LabRole already grants: S3 on cmsc471-* buckets, DynamoDB on cmsc471-job-state,
+# Textract DetectDocumentText, StepFunctions StartExecution/DescribeExecution,
+# Lambda InvokeFunction, CloudWatch Logs *, X-Ray PutTraceSegments.
+# No Policies blocks are needed on any resource — they would be silently ignored
+# when an explicit Role is present, but more importantly would trigger iam:CreateRole
+# which the Academy Learner Lab forbids.
+Parameters:
+  DBPassword:
+    Type: String
+    NoEcho: true
+    MinLength: 8
+    Default: "Cmsc471Lab!"
+    Description: RDS master password (change before production use)
+
+Globals:
+  Function:
+    Runtime: python3.11
+    Timeout: 30
+    MemorySize: 512
+    Tracing: Active
+    # Only truly shared env vars live here to avoid circular dependencies.
+    # STATE_MACHINE_ARN belongs on SubmitHandler only (StateMachine references
+    # Lambda ARNs, so putting it in Globals would create a dependency cycle).
+    # RDS_* vars belong on SaveResultsFunction only (same reason).
+    Environment:
+      Variables:
+        INBOX_BUCKET: !Ref InboxBucket
+        STATIC_SITE_BUCKET: !Ref StaticSiteBucket
+        JOB_STATE_TABLE: !Ref JobStateTable
+
+
 Resources:
-  Api:
-    Type: AWS::Serverless::Api
+
+# ============================================================================
+# NETWORK FOUNDATION - VPC (Stories S1, S2, S3)
+# ============================================================================
+
+  AppVpc:
+    Type: AWS::EC2::VPC
     Properties:
-      Name: !Sub
-        - ${ResourceName} From Stack ${AWS::StackName}
-        - ResourceName: Api
-      StageName: Prod
-      DefinitionBody:
-        openapi: '3.0'
-        info: {}
-        paths:
-          /:
-            get:
-              x-amazon-apigateway-integration:
-                httpMethod: POST
-                type: aws_proxy
-                uri: !Sub arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${HelloWorldFunction.Arn}/invocations
-              responses: {}
-      EndpointConfiguration: REGIONAL
-      TracingEnabled: true
-  HelloWorldFunction:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: cmsc471-final-vpc
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: cmsc471-igw
+
+  VpcGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref AppVpc
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref AppVpc
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: cmsc471-public-1
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref AppVpc
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: cmsc471-public-2
+
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref AppVpc
+      CidrBlock: 10.0.3.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: cmsc471-private-1
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref AppVpc
+      CidrBlock: 10.0.4.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: cmsc471-private-2
+
+  NatGatewayEip:
+    Type: AWS::EC2::EIP
+    DependsOn: VpcGatewayAttachment
+    Properties:
+      Domain: vpc
+
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatGatewayEip.AllocationId
+      SubnetId: !Ref PublicSubnet1
+      Tags:
+        - Key: Name
+          Value: cmsc471-nat
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref AppVpc
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: VpcGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnet1RouteTableAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnet2RouteTableAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet2
+      RouteTableId: !Ref PublicRouteTable
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref AppVpc
+
+  PrivateRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway
+
+  PrivateSubnet1RouteTableAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet1
+      RouteTableId: !Ref PrivateRouteTable
+
+  PrivateSubnet2RouteTableAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet2
+      RouteTableId: !Ref PrivateRouteTable
+
+# ----------------------------------------------------------------------------
+# PERSISTENCE TIER
+# ----------------------------------------------------------------------------
+
+  InboxBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'cmsc471-inbox-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders: ['*']
+            AllowedMethods: [GET, PUT, POST, DELETE, HEAD]
+            AllowedOrigins: ['*']
+            ExposedHeaders: [ETag]
+            MaxAge: 3000
+      LifecycleConfiguration:
+        Rules:
+          - Id: TransitionToGlacier
+            Status: Enabled
+            Transitions:
+              - TransitionInDays: 30
+                StorageClass: GLACIER
+
+  StaticSiteBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'cmsc471-static-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  JobStateTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: cmsc471-job-state
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: jobId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: jobId
+          KeyType: HASH
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+
+  # Lambda Security Group (for VPC-placed Lambdas)
+  LambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for Lambda functions accessing RDS
+      VpcId: !Ref AppVpc
+
+  # RDS Security Group — allows MySQL from Lambda SG only
+  RdsSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for RDS MySQL instance
+      VpcId: !Ref AppVpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          SourceSecurityGroupId: !Ref LambdaSecurityGroup
+
+  # RDS Subnet Group spanning two private AZs
+  RdsSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Private subnet group for RDS
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+
+  # Results Database — Aurora Serverless v2 fallback: db.t3.micro (Story S10)
+  ResultsDatabase:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Delete
+    Properties:
+      DBName: cmsc471results
+      Engine: mysql
+      EngineVersion: '8.0.40'
+      DBInstanceClass: db.t3.micro
+      AllocatedStorage: '20'
+      MasterUsername: cmsc471admin
+      MasterUserPassword: !Ref DBPassword
+      DBSubnetGroupName: !Ref RdsSubnetGroup
+      VPCSecurityGroups:
+        - !Ref RdsSecurityGroup
+      MultiAZ: false
+      PubliclyAccessible: false
+      StorageType: gp2
+      Tags:
+        - Key: Name
+          Value: cmsc471-results-db
+
+# ----------------------------------------------------------------------------
+# LOG GROUPS
+# ----------------------------------------------------------------------------
+
+  IndexHandlerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/cmsc471-index-handler'
+      RetentionInDays: 14
+
+  InboxHandlerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/cmsc471-inbox-handler'
+      RetentionInDays: 14
+
+  SubmitHandlerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/cmsc471-submit-handler'
+      RetentionInDays: 14
+
+  PollHandlerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/cmsc471-poll-handler'
+      RetentionInDays: 14
+
+  RecordsHandlerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/cmsc471-records-handler'
+      RetentionInDays: 14
+
+  FetchImageLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/cmsc471-fetch-image'
+      RetentionInDays: 14
+
+  CallTextractLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/cmsc471-call-textract'
+      RetentionInDays: 14
+
+  SaveResultsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/cmsc471-save-results'
+      RetentionInDays: 14
+
+  TextractWorkflowLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/stepfunctions/cmsc471-workflow'
+      RetentionInDays: 14
+
+  ApiGatewayLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/apigateway/cmsc471-api'
+      RetentionInDays: 14
+
+# ----------------------------------------------------------------------------
+# ORCHESTRATION TIER
+# ----------------------------------------------------------------------------
+
+  FetchImageFunction:
     Type: AWS::Serverless::Function
     Properties:
-      Description: !Sub
-        - Stack ${AWS::StackName} Function ${ResourceName}
-        - ResourceName: HelloWorldFunction
-      CodeUri: hello_service
-      Handler: handler.handler
-      Runtime: python3.13
-      Role: arn:aws:iam::792568887457:role/LabRole
-      MemorySize: 3008
-      Timeout: 30
-      Tracing: Active
+      FunctionName: cmsc471-fetch-image
+      CodeUri: src/fetch_image/
+      Handler: app.lambda_handler
+      Role: !Sub 'arn:aws:iam::${AWS::AccountId}:role/LabRole'
+
+  CallTextractFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: cmsc471-call-textract
+      CodeUri: src/call_textract/
+      Handler: app.lambda_handler
+      Role: !Sub 'arn:aws:iam::${AWS::AccountId}:role/LabRole'
+
+  SaveResultsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: cmsc471-save-results
+      CodeUri: src/save_results/
+      Handler: app.lambda_handler
+      Role: !Sub 'arn:aws:iam::${AWS::AccountId}:role/LabRole'
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+        SubnetIds:
+          - !Ref PrivateSubnet1
+          - !Ref PrivateSubnet2
+      Environment:
+        Variables:
+          RDS_ENDPOINT: !GetAtt ResultsDatabase.Endpoint.Address
+          RDS_DATABASE: cmsc471results
+          RDS_USERNAME: cmsc471admin
+          RDS_PASSWORD: !Ref DBPassword
+
+  TextractWorkflowStateMachine:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      Name: cmsc471-textract-workflow
+      Type: STANDARD
+      Role: !Sub 'arn:aws:iam::${AWS::AccountId}:role/LabRole'
+      Logging:
+        Level: ALL
+        IncludeExecutionData: true
+        Destinations:
+          - CloudWatchLogsLogGroup:
+              LogGroupArn: !GetAtt TextractWorkflowLogGroup.Arn
+      Definition:
+        Comment: Image-to-Text processing workflow
+        StartAt: FetchImage
+        States:
+          FetchImage:
+            Type: Task
+            Resource: !GetAtt FetchImageFunction.Arn
+            Next: CallTextract
+            Retry:
+              - ErrorEquals: ['States.TaskFailed']
+                IntervalSeconds: 2
+                MaxAttempts: 3
+                BackoffRate: 2.0
+            Catch:
+              - ErrorEquals: ['States.ALL']
+                Next: HandleError
+                ResultPath: $.error
+          CallTextract:
+            Type: Task
+            Resource: !GetAtt CallTextractFunction.Arn
+            Next: SaveResults
+            Retry:
+              - ErrorEquals: ['States.TaskFailed']
+                IntervalSeconds: 2
+                MaxAttempts: 3
+                BackoffRate: 2.0
+            Catch:
+              - ErrorEquals: ['States.ALL']
+                Next: HandleError
+                ResultPath: $.error
+          SaveResults:
+            Type: Task
+            Resource: !GetAtt SaveResultsFunction.Arn
+            End: true
+            Catch:
+              - ErrorEquals: ['States.ALL']
+                Next: HandleError
+                ResultPath: $.error
+          HandleError:
+            Type: Task
+            Resource: arn:aws:states:::dynamodb:updateItem
+            Parameters:
+              TableName: !Ref JobStateTable
+              Key:
+                jobId:
+                  S.$: $.jobId
+              AttributeUpdates:
+                status:
+                  Value:
+                    S: FAILED
+                  Action: PUT
+                error:
+                  Value:
+                    S.$: $.error.Cause
+                  Action: PUT
+            End: true
+
+# ----------------------------------------------------------------------------
+# COMPUTE TIER
+# ----------------------------------------------------------------------------
+
+  IndexHandler:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: cmsc471-index-handler
+      CodeUri: src/index_handler/
+      Handler: app.lambda_handler
+      Role: !Sub 'arn:aws:iam::${AWS::AccountId}:role/LabRole'
+      # API_ENDPOINT is NOT in env vars — that would create a circular dependency
+      # (IndexHandler → ApiGateway → IndexHandler via generated Method resources).
+      # The handler derives the URL from event.requestContext at runtime instead.
       Events:
-        ApiGET:
+        GetIndex:
           Type: Api
           Properties:
+            RestApiId: !Ref ApiGateway
             Path: /
             Method: GET
-            RestApiId: !Ref Api
-      Environment: {}
-  HelloWorldFunctionLogGroup:
-    Type: AWS::Logs::LogGroup
-    DeletionPolicy: Retain
+
+  InboxHandler:
+    Type: AWS::Serverless::Function
     Properties:
-      LogGroupName: !Sub /aws/lambda/${HelloWorldFunction}
+      FunctionName: cmsc471-inbox-handler
+      CodeUri: src/inbox_handler/
+      Handler: app.lambda_handler
+      Role: !Sub 'arn:aws:iam::${AWS::AccountId}:role/LabRole'
+      Events:
+        PostInbox:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ApiGateway
+            Path: /api/inbox
+            Method: POST
+        GetInbox:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ApiGateway
+            Path: /api/inbox
+            Method: GET
+        DeleteInbox:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ApiGateway
+            Path: /api/inbox/{key}
+            Method: DELETE
+
+  SubmitHandler:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: cmsc471-submit-handler
+      CodeUri: src/submit_handler/
+      Handler: app.lambda_handler
+      Role: !Sub 'arn:aws:iam::${AWS::AccountId}:role/LabRole'
+      Environment:
+        Variables:
+          STATE_MACHINE_ARN: !Ref TextractWorkflowStateMachine
+      Events:
+        PostJobs:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ApiGateway
+            Path: /api/jobs
+            Method: POST
+
+  PollHandler:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: cmsc471-poll-handler
+      CodeUri: src/poll_handler/
+      Handler: app.lambda_handler
+      Role: !Sub 'arn:aws:iam::${AWS::AccountId}:role/LabRole'
+      Events:
+        GetJob:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ApiGateway
+            Path: /api/jobs/{id}
+            Method: GET
+
+  RecordsHandler:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: cmsc471-records-handler
+      CodeUri: src/records_handler/
+      Handler: app.lambda_handler
+      Role: !Sub 'arn:aws:iam::${AWS::AccountId}:role/LabRole'
+      Events:
+        GetRecords:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ApiGateway
+            Path: /api/records
+            Method: GET
+        DeleteRecord:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ApiGateway
+            Path: /api/records/{id}
+            Method: DELETE
+
+  ApiGateway:
+    Type: AWS::Serverless::Api
+    Properties:
+      StageName: Prod
+      Name: cmsc471-api
+      TracingEnabled: true
+      Cors:
+        AllowMethods: "'GET,POST,DELETE,OPTIONS'"
+        AllowHeaders: "'Content-Type'"
+        AllowOrigin: "'*'"
+
 Outputs:
-  HelloWorldApi:
-    Description: 'API Gateway endpoint URL for Prod:'
-    Value: !Sub https://${Api}.execute-api.${AWS::Region}.${AWS::URLSuffix}/Prod/
+  ApiEndpoint:
+    Description: API Gateway endpoint URL
+    Value: !Sub 'https://${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com/Prod'
+
+  InboxBucketName:
+    Description: S3 bucket for image inbox
+    Value: !Ref InboxBucket
+
+  StaticSiteBucketName:
+    Description: S3 bucket for static site
+    Value: !Ref StaticSiteBucket
+
+  JobStateTableName:
+    Description: DynamoDB table for job state
+    Value: !Ref JobStateTable
+
+  StateMachineArn:
+    Description: Step Functions state machine ARN
+    Value: !Ref TextractWorkflowStateMachine
+
+  VpcId:
+    Description: VPC ID
+    Value: !Ref AppVpc
+
+  ResultsDatabaseEndpoint:
+    Description: RDS MySQL endpoint for results storage
+    Value: !GetAtt ResultsDatabase.Endpoint.Address
+
+  FrontendDeployCommand:
+    Description: Upload index.html to the static site bucket
+    Value: !Sub 'aws s3 cp ./frontend/index.html s3://${StaticSiteBucket}/index.html'
+
+  FrontendTeardownCommand:
+    Description: Remove index.html before stack delete
+    Value: !Sub 'aws s3 rm s3://${StaticSiteBucket}/index.html'
+
+  InboxTeardownCommand:
+    Description: Empty the inbox bucket before stack delete
+    Value: !Sub 'aws s3 rm s3://${InboxBucket} --recursive'
+
+  RemoveStackCommand:
+    Description: Tear down the stack (run teardown commands first)
+    Value: !Sub 'aws cloudformation delete-stack --stack-name ${AWS::StackName} --region ${AWS::Region}'

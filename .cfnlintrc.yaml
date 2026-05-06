@@ -1,0 +1,4 @@
+# W1011: suppress "use dynamic reference instead of !Ref for secrets"
+# The DBPassword parameter is acceptable for an Academy Learner Lab.
+ignore_checks:
+  - W1011
