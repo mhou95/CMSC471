@@ -1,0 +1,82 @@
+{
+  "Comment": "Image-to-Text processing workflow",
+  "StartAt": "FetchImage",
+  "States": {
+    "FetchImage": {
+      "Type": "Task",
+      "Resource": "${FetchImageArn}",
+      "Next": "CallTextract",
+      "Retry": [
+        {
+          "ErrorEquals": ["States.TaskFailed"],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "HandleError"
+        }
+      ]
+    },
+    "CallTextract": {
+      "Type": "Task",
+      "Resource": "${CallTextractArn}",
+      "Next": "SaveResults",
+      "Retry": [
+        {
+          "ErrorEquals": ["States.TaskFailed"],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "HandleError"
+        }
+      ]
+    },
+    "SaveResults": {
+      "Type": "Task",
+      "Resource": "${SaveResultsArn}",
+      "End": true,
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "HandleError"
+        }
+      ]
+    },
+    "HandleError": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::dynamodb:updateItem",
+      "Parameters": {
+        "TableName": "${JobStateTable}",
+        "Key": {
+          "jobId": {
+            "S.$": "$.jobId"
+          }
+        },
+        "AttributeUpdates": {
+          "status": {
+            "Value": {
+              "S": "FAILED"
+            },
+            "Action": "PUT"
+          },
+          "error": {
+            "Value": {
+              "S.$": "$.errorMessage"
+            },
+            "Action": "PUT"
+          }
+        }
+      },
+      "End": true
+    }
+  }
+}
