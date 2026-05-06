@@ -1,0 +1,220 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Image-to-Text Extractor</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      min-height: 100vh;
+      padding: 20px;
+    }
+    .container {
+      max-width: 800px;
+      margin: 0 auto;
+      background: white;
+      border-radius: 8px;
+      box-shadow: 0 20px 60px rgba(0,0,0,.3);
+      padding: 40px;
+    }
+    header { text-align: center; margin-bottom: 40px; }
+    header h1 { color: #333; margin-bottom: 10px; }
+    header p  { color: #666; }
+    .upload-section {
+      margin-bottom: 30px;
+      padding: 20px;
+      border: 2px dashed #667eea;
+      border-radius: 8px;
+      text-align: center;
+      background: #f8f9ff;
+    }
+    input[type="file"] { margin-bottom: 15px; }
+    button {
+      background: #667eea;
+      color: white;
+      border: none;
+      padding: 10px 20px;
+      border-radius: 4px;
+      cursor: pointer;
+      font-size: 16px;
+      transition: background .3s;
+    }
+    button:hover { background: #764ba2; }
+    .job-status, .results, .records {
+      margin-bottom: 30px;
+      padding: 20px;
+      border-radius: 8px;
+      background: #f9f9f9;
+    }
+    .job-status h3, .results h3, .records h3 { color: #333; margin-bottom: 15px; }
+    .hidden { display: none; }
+    textarea {
+      width: 100%;
+      height: 200px;
+      padding: 10px;
+      border: 1px solid #ddd;
+      border-radius: 4px;
+      font-family: 'Courier New', monospace;
+      font-size: 14px;
+      margin-bottom: 15px;
+      resize: vertical;
+    }
+    .record-item {
+      padding: 10px;
+      background: white;
+      margin-bottom: 10px;
+      border: 1px solid #ddd;
+      border-radius: 4px;
+    }
+    .record-item p   { margin: 5px 0; color: #555; }
+    .record-item small { color: #999; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <header>
+      <h1>Image-to-Text Extractor</h1>
+      <p>Upload an image to extract text using AWS Textract</p>
+    </header>
+
+    <section class="upload-section">
+      <input type="file" id="imageInput" accept="image/*" required>
+      <button onclick="uploadImage()">Upload &amp; Process</button>
+    </section>
+
+    <section id="jobStatus" class="job-status hidden">
+      <h3>Job Status</h3>
+      <p>Job ID: <span id="jobId"></span></p>
+      <p>Status: <span id="status"></span></p>
+      <div id="statusMessage"></div>
+    </section>
+
+    <section id="results" class="results hidden">
+      <h3>Extracted Text</h3>
+      <textarea id="extractedText" readonly></textarea>
+      <button onclick="downloadResults()">Download Results</button>
+      <button onclick="deleteResult()">Delete Record</button>
+    </section>
+
+    <section id="records" class="records">
+      <h3>Previous Records</h3>
+      <div id="recordsList"></div>
+    </section>
+  </div>
+
+  <script>
+    // {{API_ENDPOINT}} is replaced at serve-time by src/index_handler/app.py.
+    // During local development with Live Server, set this to your API Gateway URL.
+    const API = '{{API_ENDPOINT}}';
+
+    async function uploadImage() {
+      const file = document.getElementById('imageInput').files[0];
+      if (!file) { alert('Please select an image first'); return; }
+
+      try {
+        // Upload image to inbox
+        const reader = new FileReader();
+        reader.onload = async (e) => {
+          const b64 = e.target.result.split(',')[1];
+          const uploadResp = await fetch(`${API}/api/inbox`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ filename: file.name, data: b64 }),
+          });
+          if (!uploadResp.ok) throw new Error(`Upload failed: ${uploadResp.statusText}`);
+          const { objectKey } = await uploadResp.json();
+
+          // Submit job
+          const submitResp = await fetch(`${API}/api/jobs`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ imageKey: objectKey }),
+          });
+          if (!submitResp.ok) throw new Error(`Submit failed: ${submitResp.statusText}`);
+          const { jobId } = await submitResp.json();
+
+          document.getElementById('jobStatus').classList.remove('hidden');
+          document.getElementById('jobId').textContent = jobId;
+          pollJobStatus(jobId);
+        };
+        reader.readAsDataURL(file);
+      } catch (err) {
+        console.error(err);
+        alert(`Error: ${err.message}`);
+      }
+    }
+
+    async function pollJobStatus(jobId) {
+      let attempt = 0;
+      const iv = setInterval(async () => {
+        attempt++;
+        try {
+          const resp = await fetch(`${API}/api/jobs/${jobId}`);
+          const data = await resp.json();
+          document.getElementById('status').textContent = data.status;
+          if (data.status === 'SUCCEEDED') {
+            clearInterval(iv);
+            showResults(data.extractedText, jobId);
+            loadRecords();
+          } else if (data.status === 'FAILED') {
+            clearInterval(iv);
+            document.getElementById('statusMessage').innerHTML =
+              '<p style="color:red">Job failed</p>';
+          }
+        } catch (e) { console.error('Poll error:', e); }
+        if (attempt >= 60) {
+          clearInterval(iv);
+          document.getElementById('statusMessage').innerHTML =
+            '<p style="color:orange">Job still processing…</p>';
+        }
+      }, 2000);
+    }
+
+    function showResults(text, jobId) {
+      const ta = document.getElementById('extractedText');
+      ta.value = text;
+      ta.dataset.jobId = jobId;
+      document.getElementById('results').classList.remove('hidden');
+    }
+
+    function downloadResults() {
+      const ta  = document.getElementById('extractedText');
+      const a   = document.createElement('a');
+      a.href    = 'data:text/plain;charset=utf-8,' + encodeURIComponent(ta.value);
+      a.download = `result-${ta.dataset.jobId}.txt`;
+      a.click();
+    }
+
+    async function deleteResult() {
+      const jobId = document.getElementById('extractedText').dataset.jobId;
+      if (!confirm(`Delete record ${jobId}?`)) return;
+      const resp = await fetch(`${API}/api/records/${jobId}`, { method: 'DELETE' });
+      if (resp.ok) {
+        document.getElementById('results').classList.add('hidden');
+        loadRecords();
+      } else { alert('Delete failed'); }
+    }
+
+    async function loadRecords() {
+      try {
+        const resp = await fetch(`${API}/api/records`);
+        const records = await resp.json();
+        const list = document.getElementById('recordsList');
+        list.innerHTML = records.length
+          ? records.map(r => `
+              <div class="record-item">
+                <p><strong>Job ID:</strong> ${r.jobId}</p>
+                <small>${new Date(r.createdAt).toLocaleString()}</small>
+                <p>${(r.extractedText || '').substring(0, 100)}…</p>
+              </div>`).join('')
+          : '<p>No records found</p>';
+      } catch (e) { console.error('Load records error:', e); }
+    }
+
+    window.addEventListener('load', loadRecords);
+  </script>
+</body>
+</html>
